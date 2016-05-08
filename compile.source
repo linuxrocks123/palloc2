@@ -1,0 +1,1 @@
+gcc -DNDEBUG -O3 -march=native -fPIC -ftls-model=initial-exec -fweb -fno-builtin-malloc -shared -ldl palloc.c -o libPALLOC2.so
