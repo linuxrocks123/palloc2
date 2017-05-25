@@ -17,19 +17,23 @@
 #include "palloc_config.h"
 #include "plocklib.h"
 
+#define likely(x) __builtin_expect ((x), 1)
+#define unlikely(x) __builtin_expect ((x), 0)
+
 struct page_record;
 
 /*This structure is designed to be cachelicious.
    Please take care to preserve this property if you modify it.*/
 struct thread_record
 {
-	struct page_record* buckets[NUM_PALLOC_BUCKETS*2];
-
-	plocklib_simple_t threadlock;
-	uint16_t pad16;
-	plocklib_simple_t pad8;
-    	uint32_t pad32;
-    	uint64_t pad64;
+     //The *2 is because the first NUM_PALLOC_BUCKETS are head pointers; last NUM_PALLOC_BUCKETS are tail pointers
+     struct page_record* buckets[NUM_PALLOC_BUCKETS*2];
+     
+     plocklib_simple_t threadlock;
+     uint16_t pad16;
+     plocklib_simple_t pad8;
+     uint32_t pad32;
+     uint64_t pad64;
 };
 
 /*Also cachelicious.*/
@@ -107,7 +111,7 @@ static inline void process_remote_frees(struct page_record* bucket)
 static inline void* heapspace(struct page_record** bucket, int size_class)
 {
 	dbgprintf("heapspace: size class %d\n",size_class);
-	if(!*bucket)
+	if(unlikely (!*bucket))
 	{
 		dbgprintf("heapspace: no bucket\n");
 		*bucket = (struct page_record*)(mmap_address_class(size_class,min(size_class,PALLOC_HACK_MAX_SIZE_CLASS)));
@@ -142,7 +146,7 @@ static inline void* heapspace(struct page_record** bucket, int size_class)
 	dbgprintf("heapspace: bucket valid\n");
 
 	/*Update remote free buffer*/
-	if(!(*bucket)->free_entries)
+	if(unlikely (!(*bucket)->free_entries))
 		process_remote_frees(*bucket);
 
 	int i=0;
@@ -161,24 +165,24 @@ static inline void* heapspace(struct page_record** bucket, int size_class)
 	dbgprintf("heapspace: chkpt 1\n");
 
 	/*If we've filled the head, make the next entry the head of the list*/
-	if(!(*bucket)->free_entries)
+	if(unlikely (!(*bucket)->free_entries))
 	{
-		dbgprintf("heapspace: filled page\n");
-		struct page_record* next_chain_ptr = (*bucket)->chain_forward_ptr;
-		(*bucket)->chain_back_ptr = NULL;
-                (*bucket)->cached_predecessor_entries = (uint16_t)(-1);
-		(*bucket)->chain_forward_ptr = NULL;
-		assert(!(*bucket)->chain_back_ptr);
-		*bucket = next_chain_ptr;
-		if(*bucket)
-		{
-			assert((*bucket)->chain_back_ptr);
-			(*bucket)->chain_back_ptr = NULL;
-                        (*bucket)->cached_predecessor_entries = (uint16_t)(-1);
-		}
-                else
-                        *(bucket + NUM_PALLOC_BUCKETS) = NULL;
-		dbgprintf("heapspace: handled free page\n");
+         dbgprintf("heapspace: filled page\n");
+         struct page_record* next_chain_ptr = (*bucket)->chain_forward_ptr;
+         (*bucket)->chain_back_ptr = NULL;
+         (*bucket)->cached_predecessor_entries = (uint16_t)(-1);
+         (*bucket)->chain_forward_ptr = NULL;
+         assert(!(*bucket)->chain_back_ptr);
+         *bucket = next_chain_ptr;
+         if(*bucket)
+         {
+              assert((*bucket)->chain_back_ptr);
+              (*bucket)->chain_back_ptr = NULL;
+              (*bucket)->cached_predecessor_entries = (uint16_t)(-1);
+         }
+         else
+              *(bucket + NUM_PALLOC_BUCKETS) = NULL;
+         dbgprintf("heapspace: handled free page\n");
 	}
 
 	return page_base + (i*bits_in(uint64_t) + (bits_in(uint64_t) - 1 - bitpos))*(MIN_SIZE_CLASS << size_class);
@@ -191,8 +195,16 @@ void* malloc(size_t size)
     size = align_size_class(size,&size_class);
 
     void* to_return;
-    if(size_class >= PALLOC_HACK_ABSURDLY_HUGE_SIZE_CLASS)
-    	to_return = mmap_address_class(size_class,size_class - PALLOC_HACK_SINGLETON_MMAP_OFFSET);
+    if(unlikely (size_class >= PALLOC_HACK_ABSURDLY_HUGE_SIZE_CLASS))
+    {
+         if(threads[tls_index].buckets[size_class])
+         {
+              to_return = threads[tls_index].buckets[size_class];
+              threads[tls_index].buckets[size_class] = ((struct page_record*)(to_return))->chain_forward_ptr;
+         }
+         else
+              to_return = mmap_address_class(size_class,size_class - PALLOC_HACK_SINGLETON_MMAP_OFFSET);
+    }
     else
     	to_return = heapspace(threads[tls_index].buckets + size_class, size_class);
     dbgprintf("...0x%zx thread %d\n",to_return,tls_index);
@@ -229,44 +241,44 @@ static inline void local_free(void* address, struct page_record* record, int siz
 	}
 	else
 #endif
-        if(!old_free_entries) /*we were previously full and need to insert ourselves as tail of our chain*/
-	{
-		dbgprintf("page addition to list\n");
-		if(*(record->chain_head_ptr + NUM_PALLOC_BUCKETS))
-		{
-			record->chain_back_ptr = *(record->chain_head_ptr + NUM_PALLOC_BUCKETS);
-                        record->cached_predecessor_entries = record->chain_back_ptr->free_entries;
-                        (*(record->chain_head_ptr + NUM_PALLOC_BUCKETS))->chain_forward_ptr = record;
-                        *(record->chain_head_ptr + NUM_PALLOC_BUCKETS) = record;
-                }
-                else
-                {
-                        *(record->chain_head_ptr) = record;
-                        *(record->chain_head_ptr + NUM_PALLOC_BUCKETS) = record;
-                        record->cached_predecessor_entries = (uint16_t)(-1);
-                }
-	}
-	else if(record->cached_predecessor_entries!=(uint16_t)(-1) && record->free_entries > record->cached_predecessor_entries) /*we need to check if we should swap ourselves down the list -- use cached_predecessor_entries==-1 to enforce never swapping if we are head or next-to-head*/
-	{
-		dbgprintf("page list restructuring\n");
-	    record->cached_predecessor_entries = record->chain_back_ptr==*(record->chain_head_ptr) ? (uint16_t)(-1) : record->chain_back_ptr->free_entries;
-	    if(record->free_entries > record->cached_predecessor_entries)
-	    {
-	    	struct page_record* successor = record->chain_forward_ptr;
-	    	struct page_record* predecessor = record->chain_back_ptr;
-	    	record->chain_back_ptr = predecessor->chain_back_ptr;
-    		record->cached_predecessor_entries = record->chain_back_ptr==*(record->chain_head_ptr) ? (uint16_t)(-1) : record->chain_back_ptr->free_entries;
-    		record->chain_back_ptr->chain_forward_ptr = record;
-	    	record->chain_forward_ptr = predecessor;
-	    	predecessor->chain_back_ptr = record;
-	    	predecessor->cached_predecessor_entries = record->free_entries;
-	    	predecessor->chain_forward_ptr = successor;
-	    	if(!successor)
-	    		*(predecessor->chain_head_ptr + NUM_PALLOC_BUCKETS) = predecessor;
-	    	else /*We are intentionally being conservative and NOT updating predecessor->cached_successor_free_entries in order to avoid a cache miss.*/
-	    		successor->chain_back_ptr = predecessor;
-	    }
-	}
+         if(unlikely (!old_free_entries)) /*we were previously full and need to insert ourselves as tail of our chain*/
+         {
+              dbgprintf("page addition to list\n");
+              if(*(record->chain_head_ptr + NUM_PALLOC_BUCKETS))
+              {
+                   record->chain_back_ptr = *(record->chain_head_ptr + NUM_PALLOC_BUCKETS);
+                   record->cached_predecessor_entries = record->chain_back_ptr->free_entries;
+                   (*(record->chain_head_ptr + NUM_PALLOC_BUCKETS))->chain_forward_ptr = record;
+                   *(record->chain_head_ptr + NUM_PALLOC_BUCKETS) = record;
+              }
+              else
+              {
+                   *(record->chain_head_ptr) = record;
+                   *(record->chain_head_ptr + NUM_PALLOC_BUCKETS) = record;
+                   record->cached_predecessor_entries = (uint16_t)(-1);
+              }
+         }
+         else if(unlikely (record->cached_predecessor_entries!=(uint16_t)(-1) && record->free_entries > record->cached_predecessor_entries)) /*we need to check if we should swap ourselves down the list -- use cached_predecessor_entries==-1 to enforce never swapping if we are head or next-to-head*/
+         {
+              dbgprintf("page list restructuring\n");
+              record->cached_predecessor_entries = record->chain_back_ptr==*(record->chain_head_ptr) ? (uint16_t)(-1) : record->chain_back_ptr->free_entries;
+              if(record->free_entries > record->cached_predecessor_entries)
+              {
+                   struct page_record* successor = record->chain_forward_ptr;
+                   struct page_record* predecessor = record->chain_back_ptr;
+                   record->chain_back_ptr = predecessor->chain_back_ptr;
+                   record->cached_predecessor_entries = record->chain_back_ptr==*(record->chain_head_ptr) ? (uint16_t)(-1) : record->chain_back_ptr->free_entries;
+                   record->chain_back_ptr->chain_forward_ptr = record;
+                   record->chain_forward_ptr = predecessor;
+                   predecessor->chain_back_ptr = record;
+                   predecessor->cached_predecessor_entries = record->free_entries;
+                   predecessor->chain_forward_ptr = successor;
+                   if(!successor)
+                        *(predecessor->chain_head_ptr + NUM_PALLOC_BUCKETS) = predecessor;
+                   else /*We are intentionally being conservative and NOT updating predecessor->cached_successor_free_entries in order to avoid a cache miss.*/
+                        successor->chain_back_ptr = predecessor;
+              }
+         }
 	dbgprintf("local_free end chkpt\n");
 }
 
@@ -302,8 +314,7 @@ static inline void remote_free(void* address, struct page_record* record, int si
 	/*Perform the actual free.*/
 	uint16_t prefilled_entries = record->prefilled_entries;
 	plocklib_atomic_and(record->remote_free_array + bitmap_index,free_mask);
-	if(plocklib_increment_and_fetch(&record->pending_remote_frees) + prefilled_entries == PALLOC_PAGE_ENTRIES)
-		munmap(record,record->superpage_size);
+	plocklib_increment_and_fetch(&record->pending_remote_frees);
 }
 
 void free(void* address)
@@ -312,10 +323,14 @@ void free(void* address)
 	if(!address)
 		return;
 	int size_class = get_size_class_from_address((size_t)address);
-	if(size_class >= PALLOC_HACK_ABSURDLY_HUGE_SIZE_CLASS)
+	if(unlikely (size_class >= PALLOC_HACK_ABSURDLY_HUGE_SIZE_CLASS))
 	{
-		munmap(address,MIN_SIZE_CLASS << size_class);
-		return;
+         /*Stack rather than queue for these absurdly huge allocations.
+           The bucket tail pointers are unused, as are back pointers (singly linked list).*/
+         struct page_record* freed_huge_map = (struct page_record*)(address);
+         freed_huge_map->chain_forward_ptr = threads[tls_index].buckets[size_class];
+         threads[tls_index].buckets[size_class] = freed_huge_map;
+         return;
 	}
 	dbgprintf("free: size_class: %d\n",size_class);
 	struct page_record* address_page_record = (struct page_record*)((size_t)address & ~((MIN_SUPERPAGE_SIZE << size_class) - 1));
@@ -333,22 +348,40 @@ void free(void* address)
 	free_mask=~free_mask;
 	dbgprintf("free: free_mask: 0x%zx\n",free_mask);
 
-	if(address_page_record->owning_thread==tls_index)
+	if(likely (address_page_record->owning_thread==tls_index))
 	    local_free(address,address_page_record,size_class,bitmap_index,free_mask);
 	else
 	    remote_free(address,address_page_record,size_class,bitmap_index,free_mask);
 }
 
+size_t malloc_usable_size(void* ptr)
+{
+     int size_class = get_size_class_from_address((size_t)ptr);
+     return MIN_SIZE_CLASS << size_class;
+}
+
 void __attribute__ ((constructor)) palloc_initialize()
 {
-	plocklib_simple_init(&global_rfree_lock);
-	plocklib_simple_init(&id_lock);
-	plocklib_acquire_simple_lock(&threads[0].threadlock);
+     static int already_ran = 0;
+     dbgprintf("in palloc_initialize: %d\n",already_ran);
+     if(unlikely (!already_ran))
+     {
+#if 0
+          if(!real_mmap)
+               real_mmap = dlsym(((void*) -1l),"mmap");
+          if(!real_munmap)
+               real_munmap = dlsym(((void*) -1l),"munmap");
+#endif
+          plocklib_simple_init(&global_rfree_lock);
+          plocklib_simple_init(&id_lock);
+          plocklib_acquire_simple_lock(&threads[0].threadlock);
+          already_ran = 1;
+     }
 }
 
 void *realloc(void *ptr, size_t size)
 {
-	dbgprintf("realloc: 0x%zx %zd",ptr,size);
+	dbgprintf("realloc: 0x%zx %zd\n",ptr,size);
 	int size_class, old_size_class;
 	align_size_class(size,&size_class);
     if(ptr==NULL)

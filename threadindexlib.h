@@ -83,23 +83,12 @@ static int client_pthread_create(pthread_t *thread, const pthread_attr_t *attr, 
 static void client_pthread_exit(void *retval)
 {
      dbgprintf("begin client_pthread_exit\n");
-	/*Clean up*/
-	int i;
-	for(i=0; i<NUM_PALLOC_BUCKETS; i++)
-		if(threads[tls_index].buckets[i])
-			/*If a bucket is totally free, munmap it.*/
-			if(threads[tls_index].buckets[i]->free_entries + threads[tls_index].buckets[i]->prefilled_entries == PALLOC_PAGE_ENTRIES)
-			{
-				struct page_record* to_delete = threads[tls_index].buckets[i];
-				threads[tls_index].buckets[i] = threads[tls_index].buckets[i]->chain_forward_ptr;
-				munmap(to_delete,MIN_SUPERPAGE_SIZE << min(i,PALLOC_HACK_MAX_SIZE_CLASS));
-			}
-
-	/*Make ourselves a free thread record*/
-	plocklib_release_simple_lock(&threads[tls_index].threadlock);
-
-    dbgprintf("end client_pthread_exit\n");
-	real_pthread_exit(retval);
+     
+     /*Make ourselves a free thread record*/
+     plocklib_release_simple_lock(&threads[tls_index].threadlock);
+     
+     dbgprintf("end client_pthread_exit\n");
+     real_pthread_exit(retval);
 }
 
 #ifndef SPECIALSNOWFLAKE
@@ -109,9 +98,9 @@ int pthread_create(pthread_t * thread,
 {
      if(!real_pthread_create)
      {
-	  real_pthread_create = dlsym(((void *) -1l),"pthread_create");
+          real_pthread_create = dlsym(((void *) -1l),"pthread_create");
      }
-
+     
      return client_pthread_create(thread,attr,start_routine,arg);
 }
 #else
@@ -123,7 +112,7 @@ void pthread_exit(void* retval)
 {
      if(!real_pthread_exit)
      {
-	  real_pthread_exit = dlsym(((void *) -1l),"pthread_exit");
+          real_pthread_exit = dlsym(((void *) -1l),"pthread_exit");
      }
 
      client_pthread_exit(retval);
